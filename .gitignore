@@ -1,0 +1,13 @@
+# build artifacts and test output
+*.o
+*.ko
+*.ko.zst
+.*.cmd
+*.mod
+*.mod.c
+modules.order
+Module.symvers
+.module-common.o
+runs/
+*.log
+dmic-patched.wav

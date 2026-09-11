@@ -1,0 +1,341 @@
+From: Fernando Ruiz <fernando.ruiz@hey.com>
+Subject: [PATCH] ASoC: rt721-sdca: power up the vendor analog gates on boards that need it
+
+On the ASUS TUF Gaming A14 FA401EA (AMD ACP 7.0, RT721 on SoundWire
+link 1, legacy snd_pci_ps path) the codec enumerates, every SoundWire
+command is acknowledged, the SDCA power domains reach PS0 and the data
+ports carry data (verified with the SoundWire port test modes), yet the
+internal speakers are silent, the DMICs deliver exact digital zeros and
+jack detection never fires. Windows plays fine on the same unit.
+
+A dump of the vendor register space shows the analog power gates off:
+nid 0x5f MISC_POWER_CTL0 = 0x0092 and the amp / mic path registers
+0x5f:0x20 / 0x5f:0x30 = 0x01c2, before and during playback. The driver
+only ever writes MISC_POWER_CTL31. Writing the D0 sequence recovered by
+stevedamnvan from the MSI Claw 8 EX AI+ Windows audio package
+(https://github.com/stevedamnvan/msi-claw-8-ex-linux, same symptoms on
+an Intel Lunar Lake / SOF platform) brings the codec to life: speakers
+audible, DMICs live, every step reads back as written.
+
+Apply the codec-wide sequence after the presets in io_init and on
+resume, its inverse on runtime suspend, and the per-path sequences
+around the PDE41 (amp) / PDE2A (mic) power-state requests. Gate it on
+DMI (ASUS FA401EA, MSI MS-1T91) with a vendor_power_seq module
+parameter to force or disable it, so other RT721 boards with the same
+"fully configured but silent" symptom can test it.
+
+Tested on ASUS TUF Gaming A14 FA401EA (BIOS 301, ACP rev 0x70),
+kernel 7.2.3.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=221310
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=221958
+Suggested-by: stevedamnvan <100538383+stevedamnvan@users.noreply.github.com>
+---
+--- a/sound/soc/codecs/rt721-sdca.c
++++ b/sound/soc/codecs/rt721-sdca.c
+@@ -9,6 +9,7 @@
+ #include <linux/bitops.h>
+ #include <sound/core.h>
+ #include <linux/delay.h>
++#include <linux/dmi.h>
+ #include <linux/init.h>
+ #include <sound/initval.h>
+ #include <sound/jack.h>
+@@ -27,6 +28,147 @@
+ #include "rt721-sdca.h"
+ #include "rt-sdw-common.h"
+ 
++static int vendor_power_seq = -1;
++module_param(vendor_power_seq, int, 0444);
++MODULE_PARM_DESC(vendor_power_seq, "Vendor analog power sequence: -1 = auto (DMI match), 0 = off, 1 = on");
++
++/*
++ * On some boards the RT721's analog blocks are gated by vendor registers that
++ * the SDCA power-domain requests (PDE PS0) do not touch. Without this sequence
++ * every function stays digitally alive but analog-dead: the speaker amplifier
++ * is silent, the DMICs deliver exact digital zeros and jack detection never
++ * fires, while every SoundWire command is acknowledged. The Windows driver
++ * writes these registers; the sequence was recovered from the MSI Claw 8 EX
++ * AI+ audio package by stevedamnvan (msi-claw-8-ex-linux) and verified on the
++ * ASUS TUF Gaming A14 FA401EA (AMD ACP 7.0, SoundWire link 1).
++ */
++static const struct dmi_system_id rt721_sdca_quirk_table[] = {
++	{
++		.matches = {
++			DMI_EXACT_MATCH(DMI_BOARD_VENDOR, "ASUSTeK COMPUTER INC."),
++			DMI_EXACT_MATCH(DMI_BOARD_NAME, "FA401EA"),
++		},
++		.driver_data = (void *)RT721_SDCA_QUIRK_VENDOR_POWER_SEQ,
++	},
++	{
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Micro-Star International Co., Ltd."),
++			DMI_EXACT_MATCH(DMI_BOARD_NAME, "MS-1T91"),
++		},
++		.driver_data = (void *)RT721_SDCA_QUIRK_VENDOR_POWER_SEQ,
++	},
++	{}
++};
++
++struct rt721_sdca_power_step {
++	u8 nid;
++	u8 reg;
++	u16 mask;
++	u16 val;
++};
++
++static const struct rt721_sdca_power_step rt721_sdca_codec_d0[] = {
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(15), BIT(15) },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(14), BIT(14) },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(13), BIT(13) },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(12), BIT(12) },
++	{ RT721_ANA_POW_PART, 0x11, BIT(15), BIT(15) },
++	{ RT721_ANA_POW_PART, 0x0c, BIT(15), BIT(15) },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(3), BIT(3) },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(10), BIT(10) },
++	{ RT721_ANA_POW_PART, 0x13, BIT(6), BIT(6) },
++	{ RT721_ANA_POW_PART, 0x0e, BIT(3), BIT(3) },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(2), BIT(2) },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(9), BIT(9) },
++	{ RT721_HDA_SDCA_FLOAT, RT721_UMP_HID_CTRL3, BIT(15), BIT(15) },
++	{ RT721_HDA_SDCA_FLOAT, RT721_UMP_HID_CTRL3, BIT(15), 0 },
++};
++
++static const struct rt721_sdca_power_step rt721_sdca_codec_d3[] = {
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(15), 0 },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(14), 0 },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(13), 0 },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(12), 0 },
++	{ RT721_ANA_POW_PART, 0x11, BIT(15), 0 },
++	{ RT721_ANA_POW_PART, 0x0c, BIT(15), 0 },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(3), 0 },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(10), 0 },
++	{ RT721_ANA_POW_PART, 0x13, BIT(6), 0 },
++	{ RT721_ANA_POW_PART, 0x0e, BIT(3), 0 },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(2), 0 },
++	{ RT721_VENDOR_ANA_CTL, RT721_MISC_POWER_CTL0, BIT(9), 0 },
++};
++
++/* per-path (amp: reg 0x20, mic: reg 0x30) gates in vendor order */
++static const unsigned int rt721_sdca_path_d0[] = {
++	BIT(11), BIT(10), BIT(5), BIT(0), BIT(9), BIT(4),
++	BIT(2), BIT(12), BIT(13), BIT(14), BIT(15),
++};
++
++static const unsigned int rt721_sdca_path_d3[] = {
++	BIT(15), BIT(14), BIT(13), BIT(12), BIT(5), BIT(4),
++	BIT(2), BIT(10), BIT(11), BIT(9), BIT(0),
++};
++
++static void rt721_sdca_power_steps(struct rt721_sdca_priv *rt721,
++				   const struct rt721_sdca_power_step *steps,
++				   size_t num_steps)
++{
++	size_t i;
++	int ret;
++
++	for (i = 0; i < num_steps; i++) {
++		ret = rt_sdca_index_update_bits(rt721->mbq_regmap,
++						steps[i].nid, steps[i].reg,
++						steps[i].mask, steps[i].val);
++		if (ret)
++			dev_warn(&rt721->slave->dev,
++				 "vendor power step %zu (nid %#x reg %#x) failed: %d\n",
++				 i, steps[i].nid, steps[i].reg, ret);
++	}
++}
++
++void rt721_sdca_vendor_power(struct rt721_sdca_priv *rt721, bool power_up)
++{
++	unsigned int val;
++
++	if (!(rt721->quirks & RT721_SDCA_QUIRK_VENDOR_POWER_SEQ))
++		return;
++
++	if (power_up)
++		rt721_sdca_power_steps(rt721, rt721_sdca_codec_d0,
++				       ARRAY_SIZE(rt721_sdca_codec_d0));
++	else
++		rt721_sdca_power_steps(rt721, rt721_sdca_codec_d3,
++				       ARRAY_SIZE(rt721_sdca_codec_d3));
++
++	if (!rt_sdca_index_read(rt721->mbq_regmap, RT721_VENDOR_ANA_CTL,
++				RT721_MISC_POWER_CTL0, &val))
++		dev_dbg(&rt721->slave->dev, "vendor analog power %s: MISC_POWER_CTL0=%#x\n",
++			power_up ? "up" : "down", val);
++}
++
++static void rt721_sdca_vendor_path_power(struct rt721_sdca_priv *rt721,
++					 unsigned int reg, bool power_up)
++{
++	const unsigned int *bits = power_up ? rt721_sdca_path_d0 : rt721_sdca_path_d3;
++	size_t i;
++	int ret;
++
++	if (!(rt721->quirks & RT721_SDCA_QUIRK_VENDOR_POWER_SEQ))
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(rt721_sdca_path_d0); i++) {
++		ret = rt_sdca_index_update_bits(rt721->mbq_regmap,
++						RT721_VENDOR_ANA_CTL, reg,
++						bits[i], power_up ? bits[i] : 0);
++		if (ret)
++			dev_warn(&rt721->slave->dev,
++				 "vendor path power step %zu (reg %#x) failed: %d\n",
++				 i, reg, ret);
++	}
++}
++
+ static void rt721_sdca_jack_detect_handler(struct work_struct *work)
+ {
+ 	struct rt721_sdca_priv *rt721 =
+@@ -1051,6 +1193,7 @@
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_POST_PMU:
++		rt721_sdca_vendor_path_power(rt721, RT721_MISC_POWER_CTL20, true);
+ 		regmap_write(rt721->regmap,
+ 			SDW_SDCA_CTL(FUNC_NUM_AMP, RT721_SDCA_ENT_PDE41,
+ 				RT721_SDCA_CTL_REQ_POWER_STATE, 0), ps0);
+@@ -1059,6 +1202,7 @@
+ 		regmap_write(rt721->regmap,
+ 			SDW_SDCA_CTL(FUNC_NUM_AMP, RT721_SDCA_ENT_PDE41,
+ 				RT721_SDCA_CTL_REQ_POWER_STATE, 0), ps3);
++		rt721_sdca_vendor_path_power(rt721, RT721_MISC_POWER_CTL20, false);
+ 		break;
+ 	}
+ 	return 0;
+@@ -1074,6 +1218,7 @@
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_POST_PMU:
++		rt721_sdca_vendor_path_power(rt721, RT721_MISC_POWER_CTL30, true);
+ 		regmap_write(rt721->regmap,
+ 			SDW_SDCA_CTL(FUNC_NUM_MIC_ARRAY, RT721_SDCA_ENT_PDE2A,
+ 				RT721_SDCA_CTL_REQ_POWER_STATE, 0), ps0);
+@@ -1082,6 +1227,7 @@
+ 		regmap_write(rt721->regmap,
+ 			SDW_SDCA_CTL(FUNC_NUM_MIC_ARRAY, RT721_SDCA_ENT_PDE2A,
+ 				RT721_SDCA_CTL_REQ_POWER_STATE, 0), ps3);
++		rt721_sdca_vendor_path_power(rt721, RT721_MISC_POWER_CTL30, false);
+ 		break;
+ 	}
+ 	return 0;
+@@ -1472,6 +1618,11 @@
+ 	rt721->slave = slave;
+ 	rt721->regmap = regmap;
+ 	rt721->mbq_regmap = mbq_regmap;
++	if (vendor_power_seq > 0 ||
++	    (vendor_power_seq < 0 && dmi_first_match(rt721_sdca_quirk_table))) {
++		rt721->quirks |= RT721_SDCA_QUIRK_VENDOR_POWER_SEQ;
++		dev_info(dev, "enabling vendor analog power sequence\n");
++	}
+ 
+ 	regcache_cache_only(rt721->regmap, true);
+ 	regcache_cache_only(rt721->mbq_regmap, true);
+@@ -1534,6 +1685,7 @@
+ 	rt721_sdca_dmic_preset(rt721);
+ 	rt721_sdca_amp_preset(rt721);
+ 	rt721_sdca_jack_preset(rt721);
++	rt721_sdca_vendor_power(rt721, true);
+ 	if (rt721->first_hw_init) {
+ 		regcache_cache_bypass(rt721->regmap, false);
+ 		regcache_mark_dirty(rt721->regmap);
+--- a/sound/soc/codecs/rt721-sdca.h
++++ b/sound/soc/codecs/rt721-sdca.h
+@@ -21,6 +21,7 @@
+ 	struct snd_soc_component *component;
+ 	struct sdw_slave *slave;
+ 	struct sdw_bus_params params;
++	unsigned long quirks;
+ 	bool hw_init;
+ 	bool first_hw_init;
+ 	struct mutex calibrate_mutex;
+@@ -127,6 +128,8 @@
+ 
+ /* Index (NID:5fh) */
+ #define RT721_MISC_POWER_CTL0			0x00
++#define RT721_MISC_POWER_CTL20			0x20
++#define RT721_MISC_POWER_CTL30			0x30
+ #define RT721_MISC_POWER_CTL31			0x31
+ #define RT721_UAJ_TOP_TCON13			0x44
+ #define RT721_UAJ_TOP_TCON14			0x45
+@@ -268,6 +271,10 @@
+ 	RT721_AIFS,
+ };
+ 
++/* quirks */
++#define RT721_SDCA_QUIRK_VENDOR_POWER_SEQ	BIT(0)
++
++void rt721_sdca_vendor_power(struct rt721_sdca_priv *rt721, bool power_up);
+ int rt721_sdca_io_init(struct device *dev, struct sdw_slave *slave);
+ int rt721_sdca_init(struct device *dev, struct regmap *regmap,
+ 			struct regmap *mbq_regmap, struct sdw_slave *slave);
+--- a/sound/soc/codecs/rt721-sdca-sdw.c
++++ b/sound/soc/codecs/rt721-sdca-sdw.c
+@@ -62,6 +62,10 @@
+ static bool rt721_sdca_mbq_readable_register(struct device *dev, unsigned int reg)
+ {
+ 	switch (reg) {
++	case 0x010000c:
++	case 0x010000e:
++	case 0x0100011:
++	case 0x0100013:
+ 	case 0x0900004 ... 0x0900009:
+ 	case 0x0a00005:
+ 	case 0x0c00005:
+@@ -79,6 +83,9 @@
+ 	case 0x5810039:
+ 	case 0x5b10018:
+ 	case 0x5b10019:
++	case 0x5f00000:
++	case 0x5f00020:
++	case 0x5f00030:
+ 	case 0x5f00045:
+ 	case 0x5f00048:
+ 	case 0x6100000:
+@@ -90,6 +97,7 @@
+ 	case 0x6100013:
+ 	case 0x6100015:
+ 	case 0x6100017:
++	case 0x610001a:
+ 	case 0x6100025:
+ 	case 0x6100029:
+ 	case 0x610002c ... 0x610002f:
+@@ -154,6 +162,14 @@
+ 	case 0x5810039:
+ 	case 0x5b10018:
+ 	case 0x5b10019:
++	case 0x010000c:
++	case 0x010000e:
++	case 0x0100011:
++	case 0x0100013:
++	case 0x5f00000:
++	case 0x5f00020:
++	case 0x5f00030:
++	case 0x610001a:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -446,6 +462,8 @@
+ 	cancel_delayed_work_sync(&rt721->jack_detect_work);
+ 	cancel_delayed_work_sync(&rt721->jack_btn_check_work);
+ 
++	rt721_sdca_vendor_power(rt721, false);
++
+ 	regcache_cache_only(rt721->regmap, true);
+ 	regcache_cache_only(rt721->mbq_regmap, true);
+ 
+@@ -510,8 +528,9 @@
+ 	}
+ 
+ 	regcache_cache_only(rt721->regmap, false);
+-	regcache_sync(rt721->regmap);
+ 	regcache_cache_only(rt721->mbq_regmap, false);
++	rt721_sdca_vendor_power(rt721, true);
++	regcache_sync(rt721->regmap);
+ 	regcache_sync(rt721->mbq_regmap);
+ 	return 0;
+ }
+-- 
+2.55.0

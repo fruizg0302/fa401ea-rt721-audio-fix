@@ -1,0 +1,4 @@
+# out-of-tree build of the RT721 SDCA codec driver (snd_soc_rt721_sdca)
+obj-m += snd-soc-rt721-sdca.o
+snd-soc-rt721-sdca-y := rt721-sdca.o rt721-sdca-sdw.o
+ccflags-y += -I$(src)
